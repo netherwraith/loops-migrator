@@ -1,0 +1,14 @@
+# Exported account data and media
+loops_backup_*/
+loops_export/
+*.partial/
+*.previous-*/
+
+# Credentials and local configuration
+.env
+.env.*
+*.token
+
+# Editor and operating-system files
+.DS_Store
+*.swp
