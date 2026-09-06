@@ -55,7 +55,7 @@ printf '%s' 'YOUR_ACCESS_TOKEN' > ~/.config/loops-migrator-token
 chmod 600 ~/.config/loops-migrator-token
 
 ./loops-migrator.sh check \
-  --source https://loops.federalized.eu \
+  --source https://your.loops.tld \
   --token-file ~/.config/loops-migrator-token
 ```
 
@@ -67,7 +67,7 @@ You can also use `LOOPS_TOKEN_FILE`, `LOOPS_TOKEN`, or `--token`. The token is u
 chmod +x loops-migrator.sh
 
 ./loops-migrator.sh export \
-  --source https://loops.federalized.eu \
+  --source https://your.loops.tld \
   --token-file ~/.config/loops-migrator-token \
   --output-dir ./loops_backup
 ```
