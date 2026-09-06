@@ -8,6 +8,9 @@ loops_export/
 .env
 .env.*
 *.token
+.imported_posts
+.import_pending
+import-log.jsonl
 
 # Editor and operating-system files
 .DS_Store

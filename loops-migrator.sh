@@ -2,13 +2,12 @@
 # loops-migrator.sh
 # Copyright (c) 2026 Oliver Pifferi, E-Mail: oliver@pifferi.io
 # ---------------------
-# Exports and verifies a portable Loops account backup. Import support will be
-# added when Loops exposes a lossless restore path for the exported data.
+# Exports, verifies and re-publishes a portable Loops account backup.
 # Dependencies: curl, jq, and either shasum or sha256sum.
 
 set -o pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.2.0"
 DEFAULT_SOURCE="${LOOPS_SOURCE:-https://loops.federalized.eu}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -24,10 +23,15 @@ METADATA_ONLY=0
 ALLOW_HTTP=0
 FORCE=0
 RESTART=0
+DRY_RUN=0
+ASSUME_YES=0
+ALLOW_SAME_INSTANCE=0
+SKIP_THUMBNAILS=0
+UPLOAD_UNCERTAIN=0
 
 usage() {
     cat <<'EOF'
-Loops Migrator — export uploaded videos and their post metadata
+Loops Migrator — export, verify and re-publish Loops videos
 
 Usage:
   ./loops-migrator.sh export [--source URL] [--token TOKEN | --token-file FILE]
@@ -35,16 +39,25 @@ Usage:
                            [--force] [--debug]
   ./loops-migrator.sh check  [--source URL] [--token TOKEN | --token-file FILE]
   ./loops-migrator.sh verify --output-dir DIR
+  ./loops-migrator.sh import --target URL --input-dir DIR
+                           [--token TOKEN | --token-file FILE] [--dry-run]
+                           [--skip-thumbnails] [--yes] [--debug]
   ./loops-migrator.sh --version
 
 Options:
   --source URL       Loops instance (default: https://loops.federalized.eu)
+  --target URL       Target Loops instance for import
   --token TOKEN      OAuth 2.0 bearer token
   --token-file FILE  Read the bearer token from a file
   --output-dir DIR   Backup directory (default: ./loops_backup_TIMESTAMP)
+  --input-dir DIR    Existing backup directory to import
   --metadata-only    Export JSON metadata without downloading media
   --restart          Discard an unfinished .partial export and start again
   --force            Replace an existing final directory; the old one is retained
+  --dry-run          Validate an import without uploading anything
+  --skip-thumbnails  Import videos without custom thumbnails
+  --yes              Skip the import confirmation prompt
+  --allow-same-instance  Permit re-publishing to the original source instance
   --allow-http       Allow plain HTTP for a local/test instance
   --debug            Print request methods, URLs and response codes (never tokens)
   -h, --help         Show this help
@@ -483,11 +496,304 @@ do_verify() {
     [[ "$failed" -eq 0 ]]
 }
 
+# ---------------------------------------------------------------------------
+# Import
+# ---------------------------------------------------------------------------
+
+import_key() {
+    printf '%s\t%s' "$1" "$2"
+}
+
+is_post_imported() {
+    local state_file="$1" target="$2" post_id="$3"
+    [[ -f "$state_file" ]] && grep -qxF -- "$(import_key "$target" "$post_id")" "$state_file"
+}
+
+resolve_backup_file() {
+    local backup_dir="$1" file_record="$2" label="$3"
+    local relative_path expected_sha expected_bytes actual_sha actual_bytes backup_real file_dir_real
+    jq -e 'type == "object" and (.path | type == "string") and
+        (.sha256 | type == "string") and (.bytes | type == "number")' \
+        <<<"$file_record" >/dev/null || { warn "Invalid ${label} record."; return 1; }
+    relative_path=$(jq -r '.path' <<<"$file_record")
+    case "$relative_path" in
+        /*|..|../*|*/..|*/../*) warn "Unsafe ${label} path: ${relative_path}"; return 1 ;;
+    esac
+    [[ "$relative_path" != *$'\n'* && "$relative_path" != *$'\t'* ]] || {
+        warn "Unsafe ${label} path."
+        return 1
+    }
+    [[ -f "$backup_dir/$relative_path" ]] || { warn "Missing ${label}: ${relative_path}"; return 1; }
+    [[ ! -L "$backup_dir/$relative_path" ]] || { warn "Refusing symlinked ${label}: ${relative_path}"; return 1; }
+    backup_real=$(cd "$backup_dir" && pwd -P) || return 1
+    file_dir_real=$(cd "$(dirname "$backup_dir/$relative_path")" && pwd -P) || return 1
+    case "${file_dir_real}/" in
+        "${backup_real}/"*) ;;
+        *) warn "${label} resolves outside the backup: ${relative_path}"; return 1 ;;
+    esac
+    expected_sha=$(jq -r '.sha256' <<<"$file_record")
+    expected_bytes=$(jq -r '.bytes' <<<"$file_record")
+    actual_sha=$(sha256_file "$backup_dir/$relative_path")
+    actual_bytes=$(file_size "$backup_dir/$relative_path")
+    [[ "$actual_sha" == "$expected_sha" && "$actual_bytes" == "$expected_bytes" ]] || {
+        warn "Integrity mismatch for ${label}: ${relative_path}"
+        return 1
+    }
+    VERIFIED_PATH="$backup_dir/$relative_path"
+}
+
+prepare_import_item() {
+    local backup_dir="$1" item="$2" video_record thumbnail_record extension allowed_formats max_mb max_bytes
+    IMPORT_ID=$(jq -r '.id // empty' <<<"$item")
+    [[ -n "$IMPORT_ID" ]] || { warn "Backup post has no ID."; return 1; }
+
+    video_record=$(jq -c '.files.video // null' <<<"$item")
+    [[ "$video_record" != null ]] || { warn "Post ${IMPORT_ID} has no local video."; return 1; }
+    resolve_backup_file "$backup_dir" "$video_record" "video for post ${IMPORT_ID}" || return 1
+    IMPORT_VIDEO_PATH="$VERIFIED_PATH"
+
+    extension="${IMPORT_VIDEO_PATH##*.}"
+    extension=$(printf '%s' "$extension" | tr '[:upper:]' '[:lower:]')
+    allowed_formats=$(jq -c '.media.allowed_video_formats // ["mp4"]' <<<"$IMPORT_TARGET_CONFIG")
+    jq -e --arg extension "$extension" 'index($extension) != null' <<<"$allowed_formats" >/dev/null || {
+        warn "Post ${IMPORT_ID} uses .${extension}; target accepts $(jq -r 'join(", ")' <<<"$allowed_formats")."
+        return 1
+    }
+    max_mb=$(jq -r '.media.max_video_size // 40 | tonumber' <<<"$IMPORT_TARGET_CONFIG" 2>/dev/null) || return 1
+    [[ "$max_mb" =~ ^[0-9]+([.][0-9]+)?$ ]] || { warn "Target returned an invalid video-size limit."; return 1; }
+    max_bytes=$(awk -v mb="$max_mb" 'BEGIN { printf "%.0f", mb * 1024 * 1024 }')
+    [[ "$(file_size "$IMPORT_VIDEO_PATH")" -ge 256000 ]] || {
+        warn "Post ${IMPORT_ID} is smaller than the target minimum of 250 KB."
+        return 1
+    }
+    [[ "$(file_size "$IMPORT_VIDEO_PATH")" -le "$max_bytes" ]] || {
+        warn "Post ${IMPORT_ID} exceeds the target limit of ${max_mb} MB."
+        return 1
+    }
+
+    IMPORT_THUMBNAIL_PATH=""
+    thumbnail_record=$(jq -c '.files.thumbnail // null' <<<"$item")
+    if [[ "$SKIP_THUMBNAILS" -ne 1 && "$thumbnail_record" != null ]]; then
+        resolve_backup_file "$backup_dir" "$thumbnail_record" "thumbnail for post ${IMPORT_ID}" || return 1
+        IMPORT_THUMBNAIL_PATH="$VERIFIED_PATH"
+        [[ "$(file_size "$IMPORT_THUMBNAIL_PATH")" -le 5242880 ]] || {
+            warn "Thumbnail for post ${IMPORT_ID} exceeds the target limit of 5 MB."
+            return 1
+        }
+    fi
+
+    IMPORT_DESCRIPTION=$(jq -r '.post.caption // .studio.caption // ""' <<<"$item")
+    IMPORT_ALT_TEXT=$(jq -r '.post.media.alt_text // ""' <<<"$item")
+    IMPORT_LANG=$(jq -r '.post.lang // ""' <<<"$item")
+    [[ ${#IMPORT_DESCRIPTION} -le 200 ]] || { warn "Post ${IMPORT_ID} caption exceeds 200 characters."; return 1; }
+    [[ ${#IMPORT_ALT_TEXT} -le 2000 ]] || { warn "Post ${IMPORT_ID} alt text exceeds 2000 characters."; return 1; }
+
+    IMPORT_CAN_DOWNLOAD=$(jq -r 'if (.post.permissions.can_download // .studio.permissions.can_download // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_CAN_COMMENT=$(jq -r 'if (.post.permissions.can_comment // .studio.permissions.can_comment // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_CAN_DUET=$(jq -r 'if (.post.permissions.can_duet // .studio.permissions.can_duet // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_CAN_STITCH=$(jq -r 'if (.post.permissions.can_stitch // .studio.permissions.can_stitch // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_CAN_EMBED=$(jq -r 'if (.post.permissions.can_embed // .studio.permissions.can_embed // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_IS_SENSITIVE=$(jq -r 'if (.post.is_sensitive // .studio.is_sensitive // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_CONTAINS_AI=$(jq -r 'if (.post.meta.contains_ai // false) == true then "true" else "false" end' <<<"$item")
+    IMPORT_CONTAINS_AD=$(jq -r 'if (.post.meta.contains_ad // false) == true then "true" else "false" end' <<<"$item")
+}
+
+api_upload_video() {
+    local target="$1" video_path="$2" thumbnail_path="$3" description="$4" alt_text="$5" lang="$6"
+    local can_download="$7" can_comment="$8" can_duet="$9" can_stitch="${10}" can_embed="${11}"
+    local is_sensitive="${12}" contains_ai="${13}" contains_ad="${14}"
+    local response_file headers_file http_code curl_rc retry_after retry_delay
+    local attempt=0
+    UPLOAD_UNCERTAIN=0
+
+    while true; do
+        response_file=$(mktemp)
+        headers_file=$(mktemp)
+        local curl_options=(-sS --connect-timeout "$CONNECT_TIMEOUT" --max-time 0
+            -D "$headers_file" -o "$response_file" -w '%{http_code}'
+            -H 'Accept: application/json' -H 'Expect:'
+            -H "Authorization: Bearer ${API_TOKEN}"
+            -F "video=@${video_path}"
+            --form-string "description=${description}"
+            --form-string "comment_state=$([[ "$can_comment" == true ]] && printf 4 || printf 0)"
+            --form-string "can_download=${can_download}"
+            --form-string "can_comment=${can_comment}"
+            --form-string "can_duet=${can_duet}"
+            --form-string "can_stitch=${can_stitch}"
+            --form-string "can_embed=${can_embed}"
+            --form-string "is_sensitive=${is_sensitive}"
+            --form-string "contains_ai=${contains_ai}"
+            --form-string "contains_ad=${contains_ad}")
+        [[ -n "$thumbnail_path" ]] && curl_options+=(-F "thumbnail=@${thumbnail_path}")
+        [[ -n "$alt_text" ]] && curl_options+=(--form-string "alt_text=${alt_text}")
+        [[ -n "$lang" ]] && curl_options+=(--form-string "lang=${lang}")
+
+        [[ "$DEBUG" -eq 1 ]] && echo "  -> POST ${target}/api/v1/studio/upload" >&2
+        rdelay
+        curl_rc=0
+        http_code=$(curl "${curl_options[@]}" "${target}/api/v1/studio/upload") || curl_rc=$?
+        API_RESPONSE=$(<"$response_file")
+        API_HTTP_CODE="${http_code:-000}"
+        retry_after=$(tr -d '\r' <"$headers_file" | sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*//p' | tail -n 1)
+        rm -f "$response_file" "$headers_file"
+        [[ "$DEBUG" -eq 1 ]] && echo "  <- HTTP ${API_HTTP_CODE}" >&2
+
+        if [[ "$curl_rc" -eq 0 && "$API_HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+            return 0
+        fi
+        if [[ "$curl_rc" -ne 0 && ! "$curl_rc" =~ ^(5|6|7|35)$ ]]; then
+            UPLOAD_UNCERTAIN=1
+            return 2
+        fi
+        if [[ "$curl_rc" -eq 0 && "$API_HTTP_CODE" != 429 ]]; then
+            [[ "$API_HTTP_CODE" =~ ^5[0-9][0-9]$ ]] && UPLOAD_UNCERTAIN=1
+            return 1
+        fi
+        if [[ "$attempt" -ge "$MAX_RETRIES" ]]; then
+            return 1
+        fi
+
+        retry_delay=$((RETRY_BASE_DELAY * (2 ** attempt)))
+        if [[ "$API_HTTP_CODE" == 429 && "$retry_after" =~ ^[0-9]+$ ]]; then
+            retry_delay="$retry_after"
+        fi
+        attempt=$((attempt + 1))
+        echo "  Retrying upload in ${retry_delay}s (attempt $((attempt + 1))/$((MAX_RETRIES + 1))) ..." >&2
+        sleep "$retry_delay"
+    done
+}
+
+write_pending_import() {
+    local pending_file="$1" target="$2" post_id="$3" temporary_file
+    temporary_file=$(mktemp "${pending_file}.XXXXXX")
+    import_key "$target" "$post_id" >"$temporary_file"
+    printf '\n' >>"$temporary_file"
+    mv "$temporary_file" "$pending_file"
+}
+
+do_import() {
+    local target="$1" backup_dir="$2" manifest posts state_file pending_file log_file
+    manifest="$backup_dir/manifest.json"
+    posts="$backup_dir/posts.json"
+    state_file="$backup_dir/.imported_posts"
+    pending_file="$backup_dir/.import_pending"
+    log_file="$backup_dir/import-log.jsonl"
+    local backup_source target_config account_name
+    local item total index=0 candidate_count=0 skipped_count=0 imported_count=0 failed_count=0 upload_rc
+    local receipt imported_at
+
+    [[ -n "$API_TOKEN" ]] || die "Provide --token, --token-file, LOOPS_TOKEN or LOOPS_TOKEN_FILE."
+    [[ -f "$manifest" && -f "$posts" ]] || die "Not a Loops backup directory: ${backup_dir}"
+    jq -e '.format == "loops-migrator" and .format_version == 1' "$manifest" >/dev/null || die "Unsupported manifest."
+    jq -e 'type == "array"' "$posts" >/dev/null || die "Invalid posts.json."
+    if [[ -s "$pending_file" ]]; then
+        die "An earlier upload has an uncertain outcome: $(<"$pending_file"). Inspect the target, then clear the marker manually."
+    fi
+
+    backup_source=$(jq -r '.source_instance // empty' "$manifest")
+    if [[ "$ALLOW_SAME_INSTANCE" -ne 1 && "${backup_source%/}" == "$target" ]]; then
+        die "Target equals the backup source. Use --allow-same-instance only if duplicate posts are intentional."
+    fi
+
+    api_request GET "${target}/api/v1/account/info/self"
+    require_api_success "Authenticating against target"
+    account_name=$(jq -r '.data.username // "unknown"' <<<"$API_RESPONSE")
+    api_request GET "${target}/api/v1/config"
+    require_api_success "Fetching target configuration"
+    jq -e '.media | type == "object"' <<<"$API_RESPONSE" >/dev/null || die "Target configuration has no media limits."
+    target_config="$API_RESPONSE"
+    IMPORT_TARGET_CONFIG="$target_config"
+
+    total=$(jq 'length' "$posts")
+    echo "=== Loops import ==="
+    echo "Backup: ${backup_dir}"
+    echo "Target: ${target} (@${account_name})"
+    echo "Posts:  ${total}"
+    echo ""
+    echo "  Validating media and metadata ..."
+    while IFS= read -r item; do
+        prepare_import_item "$backup_dir" "$item" || failed_count=$((failed_count + 1))
+    done < <(jq -c 'reverse[]' "$posts")
+    [[ "$failed_count" -eq 0 ]] || die "Import validation failed for ${failed_count} post(s). Nothing was uploaded."
+
+    while IFS= read -r item; do
+        IMPORT_ID=$(jq -r '.id' <<<"$item")
+        if is_post_imported "$state_file" "$target" "$IMPORT_ID"; then
+            skipped_count=$((skipped_count + 1))
+        else
+            candidate_count=$((candidate_count + 1))
+        fi
+    done < <(jq -c 'reverse[]' "$posts")
+
+    echo "  ${candidate_count} post(s) will be re-published; ${skipped_count} already recorded for this target."
+    echo "  Original IDs, URLs, timestamps and engagement cannot be restored."
+    echo "  Successful uploads may federate as new posts."
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "Dry run complete: all ${total} post(s) passed local and target-limit validation."
+        return 0
+    fi
+    if [[ "$ASSUME_YES" -ne 1 ]]; then
+        [[ -t 0 ]] || die "Import needs confirmation. Re-run with --yes in non-interactive mode."
+        read -r -p "Continue with re-publication? [y/N] " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || { echo "Import cancelled."; return 0; }
+    fi
+
+    touch "$state_file" "$log_file"
+    while IFS= read -r item; do
+        index=$((index + 1))
+        prepare_import_item "$backup_dir" "$item" || die "Post validation changed during import."
+        if is_post_imported "$state_file" "$target" "$IMPORT_ID"; then
+            echo "  [${index}/${total}] Skipped ${IMPORT_ID} (already imported)"
+            continue
+        fi
+        printf '  [%s/%s] Uploading %s ... ' "$index" "$total" "$IMPORT_ID"
+        write_pending_import "$pending_file" "$target" "$IMPORT_ID"
+        upload_rc=0
+        api_upload_video "$target" "$IMPORT_VIDEO_PATH" "$IMPORT_THUMBNAIL_PATH" \
+            "$IMPORT_DESCRIPTION" "$IMPORT_ALT_TEXT" "$IMPORT_LANG" "$IMPORT_CAN_DOWNLOAD" \
+            "$IMPORT_CAN_COMMENT" "$IMPORT_CAN_DUET" "$IMPORT_CAN_STITCH" "$IMPORT_CAN_EMBED" \
+            "$IMPORT_IS_SENSITIVE" "$IMPORT_CONTAINS_AI" "$IMPORT_CONTAINS_AD" || upload_rc=$?
+        if [[ "$upload_rc" -eq 0 ]]; then
+            import_key "$target" "$IMPORT_ID" >>"$state_file"
+            printf '\n' >>"$state_file"
+            : >"$pending_file"
+            imported_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            if jq -e . <<<"$API_RESPONSE" >/dev/null 2>&1; then
+                receipt=$(jq -nc --arg target "$target" --arg source_id "$IMPORT_ID" \
+                    --arg imported_at "$imported_at" --argjson response "$API_RESPONSE" \
+                    '{target:$target,source_id:$source_id,imported_at:$imported_at,response:$response}')
+            else
+                receipt=$(jq -nc --arg target "$target" --arg source_id "$IMPORT_ID" \
+                    --arg imported_at "$imported_at" --arg response "$API_RESPONSE" \
+                    '{target:$target,source_id:$source_id,imported_at:$imported_at,response:$response}')
+            fi
+            printf '%s\n' "$receipt" >>"$log_file"
+            imported_count=$((imported_count + 1))
+            echo "uploaded; processing on target"
+        else
+            failed_count=$((failed_count + 1))
+            if [[ "$UPLOAD_UNCERTAIN" -eq 1 ]]; then
+                echo "outcome uncertain"
+                die "Upload outcome for ${IMPORT_ID} is uncertain. The pending marker was retained to prevent an automatic duplicate."
+            fi
+            : >"$pending_file"
+            echo "failed (HTTP ${API_HTTP_CODE}): $(json_error_message)"
+            if [[ "$API_HTTP_CODE" == 401 || "$API_HTTP_CODE" == 403 ]]; then
+                die "Target authorization failed or its upload policy rejected the account; stopping the import."
+            fi
+        fi
+    done < <(jq -c 'reverse[]' "$posts")
+
+    echo ""
+    echo "Import complete: ${imported_count} uploaded, ${skipped_count} skipped, ${failed_count} failed."
+    [[ "$failed_count" -eq 0 ]]
+}
+
 main() {
     local command_name="${1:-}" source="$DEFAULT_SOURCE" token="${LOOPS_TOKEN:-}"
-    local token_file="${LOOPS_TOKEN_FILE:-}" output_dir=""
+    local token_file="${LOOPS_TOKEN_FILE:-}" output_dir="" input_dir="" target=""
     case "$command_name" in
-        export|check|verify) shift ;;
+        export|check|verify|import) shift ;;
         --version) echo "loops-migrator ${SCRIPT_VERSION}"; return 0 ;;
         -h|--help|'') usage; return 0 ;;
         *) usage >&2; return 1 ;;
@@ -496,13 +802,19 @@ main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --source) require_option_value "$@"; source="$2"; shift 2 ;;
+            --target) require_option_value "$@"; target="$2"; shift 2 ;;
             --token) require_option_value "$@"; token="$2"; shift 2 ;;
             --token-file) require_option_value "$@"; token_file="$2"; shift 2 ;;
             --output-dir) require_option_value "$@"; output_dir="$2"; shift 2 ;;
+            --input-dir) require_option_value "$@"; input_dir="$2"; shift 2 ;;
             --metadata-only) METADATA_ONLY=1; shift ;;
             --allow-http) ALLOW_HTTP=1; shift ;;
             --force) FORCE=1; shift ;;
             --restart) RESTART=1; shift ;;
+            --dry-run) DRY_RUN=1; shift ;;
+            --yes) ASSUME_YES=1; shift ;;
+            --skip-thumbnails) SKIP_THUMBNAILS=1; shift ;;
+            --allow-same-instance) ALLOW_SAME_INSTANCE=1; shift ;;
             --debug) DEBUG=1; shift ;;
             -h|--help) usage; return 0 ;;
             *) die "Unknown option: $1" ;;
@@ -511,7 +823,6 @@ main() {
 
     check_deps
     validate_runtime_options
-    source=$(normalise_source "$source")
     if [[ -n "$token" && -n "$token_file" ]]; then
         die "Use either --token/LOOPS_TOKEN or --token-file/LOOPS_TOKEN_FILE, not both."
     fi
@@ -520,10 +831,12 @@ main() {
 
     case "$command_name" in
         check)
+            source=$(normalise_source "$source")
             [[ -n "$API_TOKEN" ]] || die "Provide a bearer token."
             check_auth "$source"
             ;;
         export)
+            source=$(normalise_source "$source")
             [[ -n "$output_dir" ]] || output_dir="loops_backup_$(date -u '+%Y%m%dT%H%M%SZ')"
             output_dir=$(normalise_output_dir "$output_dir")
             do_export "$source" "$output_dir"
@@ -532,6 +845,13 @@ main() {
             [[ -n "$output_dir" ]] || die "verify requires --output-dir DIR."
             output_dir=$(normalise_output_dir "$output_dir")
             do_verify "$output_dir"
+            ;;
+        import)
+            [[ -n "$target" ]] || die "import requires --target URL."
+            [[ -n "$input_dir" ]] || die "import requires --input-dir DIR."
+            target=$(normalise_source "$target")
+            input_dir=$(normalise_output_dir "$input_dir")
+            do_import "$target" "$input_dir"
             ;;
     esac
 }

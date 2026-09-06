@@ -1,12 +1,12 @@
 # Loops Migrator
 
-`loops-migrator.sh` exports your Loops profile, uploaded videos, thumbnails, and the associated post metadata. It is designed for `loops.federalized.eu` but accepts any compatible Loops instance.
+`loops-migrator.sh` exports your Loops profile, uploaded videos, thumbnails, and associated post metadata, then supports re-publishing that backup to another compatible Loops instance. It is designed for `loops.federalized.eu` but accepts any compatible Loops server.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 This script was initially created for my own purpose and is in no way officially connected to [Loops](https://joinloops.org), the Loops developers or the operators of any instance. Use this script at your own risk!
 
-Version 0.1 targets the API behavior of Loops `1.0.0-beta.14` and uses only documented/read-only endpoints.
+Version 0.2 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
 
 ## Features
 
@@ -20,6 +20,9 @@ Version 0.1 targets the API behavior of Loops `1.0.0-beta.14` and uses only docu
 - Retries rate-limited, transient server and transport failures with exponential backoff
 - Verifies finished backups for missing or modified files
 - Supports metadata-only exports for posts that are still processing
+- Re-publishes backed-up videos and supported metadata to another Loops instance
+- Imports oldest posts first, with dry-run, confirmation and target-scoped resume support
+- Stops automatic retries when an upload outcome is uncertain to avoid duplicate posts
 
 ## Requirements
 
@@ -45,7 +48,7 @@ The official flow is:
 3. Exchange the returned code at `/oauth/token`.
 4. Pass the resulting access token to this script.
 
-The client needs read access. Never put a token into a committed config file or shell history. A permission-restricted token file is the preferred method:
+An export token needs `user:read` and `video:read`; an import token additionally needs `video:create`. Never put a token into a committed config file or shell history. A permission-restricted token file is the preferred method:
 
 ```bash
 printf '%s' 'YOUR_ACCESS_TOKEN' > ~/.config/loops-migrator-token
@@ -109,9 +112,72 @@ Processing items are included in metadata. Loops may not expose a downloadable s
 
 Verification recalculates every recorded size and SHA-256 checksum. It exits non-zero for missing, altered, or unsafe file paths.
 
+## Import a backup
+
+Import is a controlled re-publication of the exported videos. Run a dry-run first:
+
+```bash
+./loops-migrator.sh import \
+  --target https://new-loops-instance.example \
+  --token-file ~/.config/loops-target-token \
+  --input-dir ./loops_backup \
+  --dry-run
+```
+
+If validation succeeds, perform the import:
+
+```bash
+./loops-migrator.sh import \
+  --target https://new-loops-instance.example \
+  --token-file ~/.config/loops-target-token \
+  --input-dir ./loops_backup
+```
+
+The script verifies every video and thumbnail against its recorded size and SHA-256 checksum before asking for confirmation. Posts are uploaded oldest first so their relative order is retained. In non-interactive environments, add `--yes`.
+
+Supported metadata is mapped back to the Studio upload request:
+
+- Caption/description and alt text
+- Language
+- Sensitive-content, AI and advertising labels
+- Comment, download, duet, stitch and embed permissions, subject to target-account policy
+- Custom thumbnail, when accepted by the target
+
+Use `--skip-thumbnails` if exported thumbnails do not satisfy the target's current dimensions or format rules. Importing into the original source instance is rejected by default because it creates duplicates; `--allow-same-instance` overrides that protection explicitly.
+
+### Import resume and uncertain uploads
+
+Successful uploads are recorded by target instance and source post ID in `.imported_posts` inside the backup. Re-running the import skips only posts already recorded for that same target. `import-log.jsonl` retains the accepted upload responses. Neither file contains a bearer token.
+
+Before every upload, the script writes `.import_pending`. It clears that marker only after a definite success or failure. If the connection breaks after the server may have accepted the video, the marker remains and the import stops instead of blindly creating a duplicate. Inspect the target Studio first. If the post exists, add the target/source pair to `.imported_posts`; if it does not, clear `.import_pending` and retry.
+
+From inside the backup directory, resolve that state explicitly:
+
+```bash
+# The post exists on the target: record it as imported, then clear the marker.
+cat .import_pending >> .imported_posts
+: > .import_pending
+
+# Or, only when the post does not exist on the target: permit a new upload attempt.
+: > .import_pending
+```
+
+### What import cannot restore
+
+Loops does not currently expose a lossless restore endpoint. Imported videos are new posts, not continuations of the original ActivityPub objects. The following cannot be preserved:
+
+- Original database IDs, public URLs and ActivityPub identities
+- Original publication timestamps or edit history
+- Likes, comments, shares, views and bookmarks
+- Existing federation delivery and interaction relationships
+- Pinned order and all server-internal processing state
+- Bit-identical video quality: Loops exposes the optimized video, which the target processes again
+
+The target may enforce different upload formats, file-size limits, daily quotas, account permissions and moderation rules. Custom thumbnails currently need to be JPEG, PNG or WebP, no larger than 5 MB, and exactly 1080 x 1920 pixels. Successful API acceptance means that processing was queued; it does not guarantee that asynchronous transcoding will finish. Imported posts may federate immediately after processing. There is no quiet/local-only import mode in the current Loops upload API.
+
 ## Retry and timeout settings
 
-Transport failures, HTTP 429, and HTTP 5xx responses use bounded exponential retries. A numeric `Retry-After` response header takes precedence.
+Read-only requests and media downloads retry transport failures, HTTP 429 and HTTP 5xx responses with bounded exponential backoff. A numeric `Retry-After` response header takes precedence. Uploads automatically retry only rate limits and failures that occurred before a connection was established. Ambiguous timeouts and server errors stop the import to avoid duplicate posts.
 
 ```bash
 MAX_RETRIES=5 RETRY_BASE_DELAY=2 REQUEST_DELAY=1 \
@@ -135,7 +201,7 @@ Use `--debug` to show request URLs and HTTP status codes. Authorization headers 
 - Uploaded posts are enumerated through `GET /api/v1/studio/posts` using its opaque cursor and maximum page size of 20.
 - Published posts are enriched through `GET /api/v1/video/{id}`.
 - Profile and instance data come from `GET /api/v1/account/info/self` and `GET /api/v1/config`.
-- The export is a backup, not a re-import tool. Loops currently exposes uploads but no lossless restore endpoint for all server-side state.
+- Import uses `POST /api/v1/studio/upload` and is a best-effort re-publication, not a lossless restore.
 - Likes, shares, comments, and view counts are snapshots. Their underlying user interactions are not exported.
 - Deleted posts cannot be retrieved through these endpoints.
 - Media URLs must be absolute HTTPS URLs or instance-relative URLs. Plain HTTP is rejected unless `--allow-http` is explicitly used for a local/test server.
@@ -143,13 +209,14 @@ Use `--debug` to show request URLs and HTTP status codes. Authorization headers 
 ## Typical Backup Workflow
 
 ```text
-Loops instance                         Local backup
-──────────────                         ────────────
-1. Verify OAuth token  ─────────────►  Authenticated account check
-2. Fetch Studio posts  ─────────────►  Raw pages and posts.json
-3. Fetch post details  ─────────────►  Captions and complete metadata
-4. Download media      ─────────────►  videos/ and thumbnails/
-5. Verify checksums    ─────────────►  Integrity result
+Source instance        Local backup                 Target instance
+──────────────         ────────────                 ───────────────
+1. Verify token  ───►  Authenticated export
+2. Studio posts  ───►  posts.json + raw responses
+3. Media files   ───►  videos/ + thumbnails/
+                       4. Verify checksums
+                       5. Dry-run target limits
+                       6. Re-publish oldest first ─► New Loops posts
 ```
 
 ## Tests
