@@ -83,6 +83,59 @@ test_missing_option_value_rejected() {
     [[ $? -ne 0 && "$output" == *'--source requires a non-empty value'* ]]
 }
 
+test_auth_flow_registers_exchanges_and_saves_token() {
+    local token_file="$TEST_TMP/auth-token" call_file="$TEST_TMP/oauth-calls"
+    local registration_file="$TEST_TMP/registration.json" exchange_file="$TEST_TMP/exchange.json"
+    local checked_file="$TEST_TMP/auth-checked" output mode
+    printf '0\n' >"$call_file"
+    output=$( (
+        REQUEST_DELAY=0
+        AUTH_WRITE=1
+        NO_BROWSER=1
+        FORCE=0
+        oauth_post() {
+            local count
+            count=$(<"$call_file")
+            count=$((count + 1))
+            printf '%s\n' "$count" >"$call_file"
+            API_HTTP_CODE=200
+            if [[ "$count" -eq 1 ]]; then
+                printf '%s\n' "$2" >"$registration_file"
+                API_RESPONSE='{"client_id":"client-id","client_secret":"client-secret"}'
+            else
+                printf '%s\n' "$2" >"$exchange_file"
+                API_RESPONSE='{"access_token":"access-token","token_type":"Bearer"}'
+            fi
+        }
+        check_auth() {
+            [[ "$1" == 'https://loops.example' && "$API_TOKEN" == 'access-token' ]] || return 1
+            touch "$checked_file"
+        }
+        do_auth 'https://loops.example' "$token_file" 'Loops Migrator Test' <<<'authorization-code'
+    ) 2>&1) || return 1
+    mode=$(stat -f '%Lp' "$token_file" 2>/dev/null || stat -c '%a' "$token_file")
+    [[ "$(<"$token_file")" == 'access-token' ]] &&
+        [[ "$mode" == 600 ]] &&
+        [[ -e "$checked_file" ]] &&
+        jq -e '.client_name == "Loops Migrator Test" and .redirect_uris == "urn:ietf:wg:oauth:2.0:oob" and .scopes == "read write"' "$registration_file" >/dev/null &&
+        jq -e '.grant_type == "authorization_code" and .code == "authorization-code" and .scope == "read write"' "$exchange_file" >/dev/null &&
+        [[ "$output" == *'/oauth/authorize?'* ]] &&
+        [[ "$output" != *'client-secret'* && "$output" != *'access-token'* ]]
+}
+
+test_auth_refuses_existing_token_without_force() {
+    local token_file="$TEST_TMP/existing-token" output
+    printf 'old-token\n' >"$token_file"
+    if output=$( (
+        AUTH_WRITE=0
+        FORCE=0
+        do_auth 'https://loops.example' "$token_file" 'Loops Migrator'
+    ) 2>&1); then
+        return 1
+    fi
+    [[ "$output" == *'Token file already exists'* ]] && [[ "$(<"$token_file")" == 'old-token' ]]
+}
+
 test_complete_export_builds_manifest() {
     local backup="$TEST_TMP/complete"
     (
@@ -305,6 +358,8 @@ run_test 'repeated pagination cursor is rejected' test_repeated_cursor_rejected
 run_test 'full page without cursor is rejected' test_full_page_without_cursor_rejected
 run_test 'verification detects changed files' test_verify_detects_tampering
 run_test 'missing option value is rejected' test_missing_option_value_rejected
+run_test 'OAuth flow registers, exchanges and securely saves a token' test_auth_flow_registers_exchanges_and_saves_token
+run_test 'OAuth flow refuses to overwrite a token without force' test_auth_refuses_existing_token_without_force
 run_test 'complete export builds a token-free manifest' test_complete_export_builds_manifest
 run_test 'import dry run has no side effects' test_import_dry_run_has_no_side_effects
 run_test 'import preserves metadata and uploads oldest first' test_import_preserves_metadata_and_oldest_first

@@ -2,6 +2,24 @@
 
 All notable changes to Loops Migrator are documented in this file.
 
+## [0.3] - 2026-09-06
+
+### Added
+
+- Interactive `auth` command that registers an OAuth client, opens the authorization page, exchanges the returned code and verifies the resulting account access.
+- Read-only authorization by default and optional `--write` access for import tokens.
+- Automatic secure token-file creation with mode `0600`, atomic writes and overwrite protection.
+- `--no-browser` support for headless systems and `--client-name` customization.
+- OAuth state validation when a complete redirected URL is pasted instead of a bare authorization code.
+- Regression coverage for OAuth payloads, secret-free output and token overwrite protection.
+
+### Changed
+
+- Corrected the documented Loops OAuth scopes to the official `read` and `write` scopes.
+- Updated authentication instructions to use the automated flow.
+
+[0.3]: https://github.com/netherwraith/loops-migrator/releases/tag/v0.3
+
 ## [0.2] - 2026-09-06
 
 ### Added

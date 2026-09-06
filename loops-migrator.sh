@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="0.2.0"
+SCRIPT_VERSION="0.3.0"
 DEFAULT_SOURCE="${LOOPS_SOURCE:-https://your.loops.tld}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -28,12 +28,17 @@ ASSUME_YES=0
 ALLOW_SAME_INSTANCE=0
 SKIP_THUMBNAILS=0
 UPLOAD_UNCERTAIN=0
+AUTH_WRITE=0
+NO_BROWSER=0
 
 usage() {
     cat <<'EOF'
 Loops Migrator — export, verify and re-publish Loops videos
 
 Usage:
+  ./loops-migrator.sh auth   [--source URL] [--token-file FILE]
+                           [--write] [--client-name NAME] [--no-browser]
+                           [--force] [--debug]
   ./loops-migrator.sh export [--source URL] [--token TOKEN | --token-file FILE]
                            [--output-dir DIR] [--metadata-only] [--restart]
                            [--force] [--debug]
@@ -48,12 +53,15 @@ Options:
   --source URL       Loops instance (default: https://your.loops.tld)
   --target URL       Target Loops instance for import
   --token TOKEN      OAuth 2.0 bearer token
-  --token-file FILE  Read the bearer token from a file
+  --token-file FILE  Read the token from FILE; auth writes the new token there
+  --write             Request read/write access for imports (auth only)
+  --client-name NAME  OAuth client name (default: Loops Migrator)
+  --no-browser        Print the authorization URL without opening it (auth only)
   --output-dir DIR   Backup directory (default: ./loops_backup_TIMESTAMP)
   --input-dir DIR    Existing backup directory to import
   --metadata-only    Export JSON metadata without downloading media
   --restart          Discard an unfinished .partial export and start again
-  --force            Replace an existing final directory; the old one is retained
+  --force            Replace an existing backup or OAuth token file
   --dry-run          Validate an import without uploading anything
   --skip-thumbnails  Import videos without custom thumbnails
   --yes              Skip the import confirmation prompt
@@ -120,6 +128,127 @@ read_token_file() {
     [[ -f "$token_path" ]] || die "Token file not found: ${token_path}"
     API_TOKEN=$(tr -d '\r\n' <"$token_path")
     [[ -n "$API_TOKEN" ]] || die "Token file is empty: ${token_path}"
+}
+
+oauth_post() {
+    local request_url="$1" request_body="$2" response_file http_code curl_rc
+    response_file=$(mktemp) || die "Could not create a temporary OAuth response file."
+    [[ "$DEBUG" -eq 1 ]] && echo "  -> POST ${request_url}" >&2
+    rdelay
+    curl_rc=0
+    http_code=$(curl -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" \
+        -o "$response_file" -w '%{http_code}' -X POST \
+        -H 'Accept: application/json' -H 'Content-Type: application/json' \
+        --data-binary @- "$request_url" <<<"$request_body") || curl_rc=$?
+    API_RESPONSE=$(<"$response_file")
+    API_HTTP_CODE="${http_code:-000}"
+    rm -f "$response_file"
+    [[ "$DEBUG" -eq 1 ]] && echo "  <- HTTP ${API_HTTP_CODE}" >&2
+    [[ "$curl_rc" -eq 0 ]] || die "OAuth request failed: POST ${request_url} (curl ${curl_rc})."
+}
+
+generate_oauth_state() {
+    od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]'
+}
+
+open_authorization_url() {
+    local authorization_url="$1"
+    if [[ "$NO_BROWSER" -eq 1 ]]; then
+        return 1
+    elif command -v open >/dev/null 2>&1; then
+        open "$authorization_url" >/dev/null 2>&1
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$authorization_url" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+write_token_file() {
+    local token_path="$1" token_value="$2" token_dir temporary_file
+    [[ -n "$token_path" && "$token_path" != "/" ]] || die "Unsafe token file path: ${token_path:-empty}"
+    [[ ! -L "$token_path" ]] || die "Refusing to replace a symlinked token file: ${token_path}"
+    if [[ -e "$token_path" && "$FORCE" -ne 1 ]]; then
+        die "Token file already exists: ${token_path}. Use --force to replace it."
+    fi
+    token_dir=$(dirname "$token_path")
+    mkdir -p "$token_dir" || die "Could not create token directory: ${token_dir}"
+    temporary_file=$(mktemp "${token_path}.tmp.XXXXXX") || die "Could not create a temporary token file."
+    if ! (umask 077; printf '%s\n' "$token_value" >"$temporary_file"); then
+        rm -f "$temporary_file"
+        die "Could not write the temporary token file."
+    fi
+    chmod 600 "$temporary_file" || { rm -f "$temporary_file"; die "Could not secure the token file."; }
+    mv "$temporary_file" "$token_path" || { rm -f "$temporary_file"; die "Could not install the token file."; }
+}
+
+do_auth() {
+    local source="$1" token_file="$2" client_name="$3" scopes redirect_uri
+    local registration_payload client_id client_secret state authorization_url authorization_input
+    local authorization_code returned_state token_payload access_token
+    scopes="read"
+    [[ "$AUTH_WRITE" -eq 1 ]] && scopes="read write"
+    redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+
+    [[ -n "$token_file" ]] || die "auth requires --token-file FILE or LOOPS_TOKEN_FILE."
+    [[ ! -e "$token_file" || "$FORCE" -eq 1 ]] || \
+        die "Token file already exists: ${token_file}. Use --force to replace it."
+
+    echo "=== Loops OAuth setup ==="
+    echo "Instance: ${source}"
+    echo "Scopes:   ${scopes}"
+    echo ""
+    echo "  Registering OAuth client ..."
+    registration_payload=$(jq -nc --arg name "$client_name" --arg redirect "$redirect_uri" \
+        --arg scopes "$scopes" --arg website 'https://github.com/netherwraith/loops-migrator' \
+        '{client_name:$name,redirect_uris:$redirect,scopes:$scopes,website:$website}')
+    oauth_post "${source}/api/v1/apps" "$registration_payload"
+    require_api_success "OAuth client registration"
+    client_id=$(jq -er '.client_id | select(type == "string" and length > 0)' <<<"$API_RESPONSE" 2>/dev/null) || \
+        die "OAuth registration response has no client_id."
+    client_secret=$(jq -er '.client_secret | select(type == "string" and length > 0)' <<<"$API_RESPONSE" 2>/dev/null) || \
+        die "OAuth registration response has no client_secret."
+
+    state=$(generate_oauth_state)
+    [[ -n "$state" ]] || die "Could not generate OAuth state."
+    authorization_url="${source}/oauth/authorize?response_type=code&client_id=$(urlencode "$client_id")&redirect_uri=$(urlencode "$redirect_uri")&scope=$(urlencode "$scopes")&state=$(urlencode "$state")"
+    echo "  Opening the authorization page in your browser."
+    if ! open_authorization_url "$authorization_url"; then
+        echo "  Open this URL manually:"
+        echo "  ${authorization_url}"
+    fi
+    echo ""
+    echo "Sign in, approve access, then paste the displayed authorization code."
+    IFS= read -r -p "Authorization code: " authorization_input
+    [[ -n "$authorization_input" ]] || die "No authorization code supplied."
+
+    authorization_code="$authorization_input"
+    if [[ "$authorization_input" == *'code='* ]]; then
+        authorization_code=$(printf '%s' "$authorization_input" | sed -E 's/^.*[?&]code=([^&]*).*$/\1/')
+        returned_state=$(printf '%s' "$authorization_input" | sed -nE 's/^.*[?&]state=([^&]*).*$/\1/p')
+        [[ -n "$returned_state" ]] || die "Redirect URL has no OAuth state."
+        [[ "$returned_state" == "$state" ]] || die "OAuth state mismatch; refusing the authorization response."
+    fi
+
+    echo "  Exchanging authorization code ..."
+    token_payload=$(jq -nc --arg client_id "$client_id" --arg client_secret "$client_secret" \
+        --arg redirect "$redirect_uri" --arg code "$authorization_code" --arg scope "$scopes" \
+        '{grant_type:"authorization_code",client_id:$client_id,client_secret:$client_secret,
+          redirect_uri:$redirect,code:$code,scope:$scope}')
+    oauth_post "${source}/oauth/token" "$token_payload"
+    client_secret=''
+    token_payload=''
+    require_api_success "OAuth token exchange"
+    access_token=$(jq -er '.access_token | select(type == "string" and length > 0)' <<<"$API_RESPONSE" 2>/dev/null) || \
+        die "OAuth token response has no access_token."
+
+    API_TOKEN="$access_token"
+    API_RESPONSE=''
+    echo "  Verifying account access ..."
+    check_auth "$source"
+    write_token_file "$token_file" "$access_token"
+    access_token=''
+    echo "  Token saved securely to ${token_file}."
 }
 
 json_error_message() {
@@ -792,8 +921,9 @@ do_import() {
 main() {
     local command_name="${1:-}" source="$DEFAULT_SOURCE" token="${LOOPS_TOKEN:-}"
     local token_file="${LOOPS_TOKEN_FILE:-}" output_dir="" input_dir="" target=""
+    local client_name="Loops Migrator"
     case "$command_name" in
-        export|check|verify|import) shift ;;
+        auth|export|check|verify|import) shift ;;
         --version) echo "loops-migrator ${SCRIPT_VERSION}"; return 0 ;;
         -h|--help|'') usage; return 0 ;;
         *) usage >&2; return 1 ;;
@@ -805,6 +935,9 @@ main() {
             --target) require_option_value "$@"; target="$2"; shift 2 ;;
             --token) require_option_value "$@"; token="$2"; shift 2 ;;
             --token-file) require_option_value "$@"; token_file="$2"; shift 2 ;;
+            --client-name) require_option_value "$@"; client_name="$2"; shift 2 ;;
+            --write) AUTH_WRITE=1; shift ;;
+            --no-browser) NO_BROWSER=1; shift ;;
             --output-dir) require_option_value "$@"; output_dir="$2"; shift 2 ;;
             --input-dir) require_option_value "$@"; input_dir="$2"; shift 2 ;;
             --metadata-only) METADATA_ONLY=1; shift ;;
@@ -823,6 +956,19 @@ main() {
 
     check_deps
     validate_runtime_options
+    if [[ "$command_name" == auth ]]; then
+        [[ -z "$token" ]] || die "auth creates a new token; do not supply --token or LOOPS_TOKEN."
+        if [[ -z "$token_file" ]]; then
+            [[ -n "${HOME:-}" ]] || die "HOME is not set; provide --token-file FILE."
+            token_file="${HOME}/.config/loops-migrator-token"
+        fi
+        source=$(normalise_source "$source")
+        do_auth "$source" "$token_file" "$client_name"
+        return 0
+    fi
+    [[ "$AUTH_WRITE" -eq 0 ]] || die "--write is only valid with auth."
+    [[ "$NO_BROWSER" -eq 0 ]] || die "--no-browser is only valid with auth."
+    [[ "$client_name" == "Loops Migrator" ]] || die "--client-name is only valid with auth."
     if [[ -n "$token" && -n "$token_file" ]]; then
         die "Use either --token/LOOPS_TOKEN or --token-file/LOOPS_TOKEN_FILE, not both."
     fi

@@ -6,7 +6,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 This script was initially created for my own purpose and is in no way officially connected to [Loops](https://joinloops.org), the Loops developers or the operators of any instance. Use this script at your own risk!
 
-Version 0.2 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
+Version 0.3 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
 
 ## Features
 
@@ -41,14 +41,32 @@ brew install jq
 
 Loops uses OAuth 2.0 bearer tokens. Tokens are instance-specific secrets; a token issued by one Loops server does not authenticate against another.
 
-The official flow is:
+The migrator automates client registration, opens the Loops authorization page, exchanges the displayed code and stores the resulting token with owner-only permissions:
 
-1. Register a client with `POST /api/v1/apps`.
-2. Authorize it through `/oauth/authorize`.
-3. Exchange the returned code at `/oauth/token`.
-4. Pass the resulting access token to this script.
+```bash
+./loops-migrator.sh auth \
+  --source https://your.loops.tld \
+  --token-file ~/.config/loops-migrator-token
+```
 
-An export token needs `user:read` and `video:read`; an import token additionally needs `video:create`. Never put a token into a committed config file or shell history. A permission-restricted token file is the preferred method:
+Sign in to Loops in the browser, approve access, then paste the displayed authorization code into the terminal. If no supported browser opener is available, the command prints the URL instead; `--no-browser` forces that behavior.
+
+The default authorization requests the official `read` scope and is sufficient for exports. To create a separate token for importing into a target instance, repeat the flow against that instance with write access:
+
+```bash
+./loops-migrator.sh auth \
+  --source https://new-loops-instance.example \
+  --token-file ~/.config/loops-migrator-target-token \
+  --write
+```
+
+This requests `read write`. Existing token files are not overwritten unless `--force` is supplied. Use `--client-name NAME` to change the name shown on the Loops authorization page.
+
+If `--token-file` is omitted, `auth` writes to `~/.config/loops-migrator-token`.
+
+Under the hood, the command follows the official flow: it registers a client with `POST /api/v1/apps`, authorizes it through `/oauth/authorize`, and exchanges the returned code at `/oauth/token`.
+
+Never put a token into a committed config file or shell history. A permission-restricted token file is the preferred method. To check an existing token:
 
 ```bash
 printf '%s' 'YOUR_ACCESS_TOKEN' > ~/.config/loops-migrator-token
