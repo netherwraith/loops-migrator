@@ -45,7 +45,7 @@ Usage:
   ./loops-migrator.sh --version
 
 Options:
-  --source URL       Loops instance (default: https://loops.your.tld)
+  --source URL       Loops instance (default: https://your.loops.tld)
   --target URL       Target Loops instance for import
   --token TOKEN      OAuth 2.0 bearer token
   --token-file FILE  Read the bearer token from a file
