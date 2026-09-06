@@ -1,6 +1,6 @@
 # Loops Migrator
 
-`loops-migrator.sh` exports your Loops profile, uploaded videos, thumbnails, and associated post metadata, then supports re-publishing that backup to another compatible Loops instance. It is designed for `loops.federalized.eu` but accepts any compatible Loops server.
+`loops-migrator.sh` exports your Loops profile, uploaded videos, thumbnails, and associated post metadata, then supports re-publishing that backup to another compatible Loops instance. It was designed for my own instance but accepts any compatible Loops server.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
