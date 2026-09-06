@@ -118,10 +118,17 @@ test_auth_flow_registers_exchanges_and_saves_token() {
     [[ "$(<"$token_file")" == 'access-token' ]] &&
         [[ "$mode" == 600 ]] &&
         [[ -e "$checked_file" ]] &&
-        jq -e '.client_name == "Loops Migrator Test" and .redirect_uris == ["urn:ietf:wg:oauth:2.0:oob"] and .scopes == "read write"' "$registration_file" >/dev/null &&
-        jq -e '.grant_type == "authorization_code" and .code == "authorization-code" and .scope == "read write"' "$exchange_file" >/dev/null &&
+        jq -e '.client_name == "Loops Migrator Test" and .redirect_uris == ["urn:ietf:wg:oauth:2.0:oob"] and .scopes == "user:read video:read video:create"' "$registration_file" >/dev/null &&
+        jq -e '.grant_type == "authorization_code" and .code == "authorization-code" and .scope == "user:read video:read video:create"' "$exchange_file" >/dev/null &&
         [[ "$output" == *'/oauth/authorize?'* ]] &&
         [[ "$output" != *'client-secret'* && "$output" != *'access-token'* ]]
+}
+
+test_oauth_scopes_match_loops_server() {
+    AUTH_WRITE=0
+    [[ "$(oauth_scopes)" == 'user:read video:read' ]] || return 1
+    AUTH_WRITE=1
+    [[ "$(oauth_scopes)" == 'user:read video:read video:create' ]]
 }
 
 test_loopback_oauth_callback_captures_code_and_state() {
@@ -377,6 +384,7 @@ run_test 'full page without cursor is rejected' test_full_page_without_cursor_re
 run_test 'verification detects changed files' test_verify_detects_tampering
 run_test 'missing option value is rejected' test_missing_option_value_rejected
 run_test 'OAuth flow registers, exchanges and securely saves a token' test_auth_flow_registers_exchanges_and_saves_token
+run_test 'OAuth scopes match Loops Server read and create capabilities' test_oauth_scopes_match_loops_server
 run_test 'OAuth loopback callback captures code and state' test_loopback_oauth_callback_captures_code_and_state
 run_test 'OAuth flow refuses to overwrite a token without force' test_auth_refuses_existing_token_without_force
 run_test 'complete export builds a token-free manifest' test_complete_export_builds_manifest

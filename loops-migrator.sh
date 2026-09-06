@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="0.3.2"
+SCRIPT_VERSION="0.3.3"
 DEFAULT_SOURCE="${LOOPS_SOURCE:-https://your.loops.tld}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -58,7 +58,7 @@ Options:
   --target URL       Target Loops instance for import
   --token TOKEN      OAuth 2.0 bearer token
   --token-file FILE  Read the token from FILE; auth writes the new token there
-  --write             Request read/write access for imports (auth only)
+  --write             Also request video creation access for imports (auth only)
   --client-name NAME  OAuth client name (default: Loops Migrator)
   --no-browser        Print the authorization URL without opening it (auth only)
   --manual-code       Use the out-of-band copy/paste flow instead of localhost
@@ -303,12 +303,19 @@ write_token_file() {
     mv "$temporary_file" "$token_path" || { rm -f "$temporary_file"; die "Could not install the token file."; }
 }
 
+oauth_scopes() {
+    if [[ "$AUTH_WRITE" -eq 1 ]]; then
+        printf '%s' 'user:read video:read video:create'
+    else
+        printf '%s' 'user:read video:read'
+    fi
+}
+
 do_auth() {
     local source="$1" token_file="$2" client_name="$3" scopes redirect_uri loopback_port=""
     local registration_payload client_id client_secret state authorization_url authorization_input
     local authorization_code returned_state token_payload access_token callback_error callback_description
-    scopes="read"
-    [[ "$AUTH_WRITE" -eq 1 ]] && scopes="read write"
+    scopes=$(oauth_scopes)
     if [[ "$AUTH_MANUAL" -eq 1 ]]; then
         redirect_uri='urn:ietf:wg:oauth:2.0:oob'
     else

@@ -6,7 +6,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 This script was initially created for my own purpose and is in no way officially connected to [Loops](https://joinloops.org), the Loops developers or the operators of any instance. Use this script at your own risk!
 
-Version 0.3.2 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
+Version 0.3.3 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
 
 ## Features
 
@@ -54,7 +54,7 @@ Sign in to Loops in the browser and approve access. The browser is redirected to
 
 If no supported browser opener is available, the command prints the URL instead; `--no-browser` forces that behavior. The URL must then be opened in a browser on the same computer so it can reach the local callback.
 
-The default authorization requests the official `read` scope and is sufficient for exports. To create a separate token for importing into a target instance, repeat the flow against that instance with write access:
+The default authorization requests `user:read video:read` and is sufficient for exports. To create a separate token for importing into a target instance, repeat the flow against that instance with video-creation access:
 
 ```bash
 ./loops-migrator.sh auth \
@@ -63,7 +63,7 @@ The default authorization requests the official `read` scope and is sufficient f
   --write
 ```
 
-This requests `read write`. Existing token files are not overwritten unless `--force` is supplied. Use `--client-name NAME` to change the name shown on the Loops authorization page.
+This requests `user:read video:read video:create`. Existing token files are not overwritten unless `--force` is supplied. Use `--client-name NAME` to change the name shown on the Loops authorization page.
 
 If `--token-file` is omitted, `auth` writes to `~/.config/loops-migrator-token`.
 

@@ -2,6 +2,16 @@
 
 All notable changes to Loops Migrator are documented in this file.
 
+## [0.3.3] - 2026-09-06
+
+### Fixed
+
+- Request the scopes implemented by Loops Server (`user:read`, `video:read` and, for `--write`, `video:create`) instead of the incompatible generic `read`/`write` scopes ([#2]).
+- Clarify that the localhost page is the expected OAuth callback and displays authorization errors returned by the Loops instance.
+
+[0.3.3]: https://github.com/netherwraith/loops-migrator/releases/tag/v0.3.3
+[#2]: https://github.com/netherwraith/loops-migrator/issues/2
+
 ## [0.3.2] - 2026-09-06
 
 ### Fixed
