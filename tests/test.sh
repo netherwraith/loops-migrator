@@ -117,7 +117,7 @@ test_auth_flow_registers_exchanges_and_saves_token() {
     [[ "$(<"$token_file")" == 'access-token' ]] &&
         [[ "$mode" == 600 ]] &&
         [[ -e "$checked_file" ]] &&
-        jq -e '.client_name == "Loops Migrator Test" and .redirect_uris == "urn:ietf:wg:oauth:2.0:oob" and .scopes == "read write"' "$registration_file" >/dev/null &&
+        jq -e '.client_name == "Loops Migrator Test" and .redirect_uris == ["urn:ietf:wg:oauth:2.0:oob"] and .scopes == "read write"' "$registration_file" >/dev/null &&
         jq -e '.grant_type == "authorization_code" and .code == "authorization-code" and .scope == "read write"' "$exchange_file" >/dev/null &&
         [[ "$output" == *'/oauth/authorize?'* ]] &&
         [[ "$output" != *'client-secret'* && "$output" != *'access-token'* ]]

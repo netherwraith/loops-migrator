@@ -2,6 +2,14 @@
 
 All notable changes to Loops Migrator are documented in this file.
 
+## [0.3.1] - 2026-09-06
+
+### Fixed
+
+- Send `redirect_uris` as the JSON array required by the current Loops app-registration endpoint, fixing HTTP 422 during `auth`.
+
+[0.3.1]: https://github.com/netherwraith/loops-migrator/releases/tag/v0.3.1
+
 ## [0.3] - 2026-09-06
 
 ### Added

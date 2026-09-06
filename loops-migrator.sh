@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.3.1"
 DEFAULT_SOURCE="${LOOPS_SOURCE:-https://your.loops.tld}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -201,7 +201,7 @@ do_auth() {
     echo "  Registering OAuth client ..."
     registration_payload=$(jq -nc --arg name "$client_name" --arg redirect "$redirect_uri" \
         --arg scopes "$scopes" --arg website 'https://github.com/netherwraith/loops-migrator' \
-        '{client_name:$name,redirect_uris:$redirect,scopes:$scopes,website:$website}')
+        '{client_name:$name,redirect_uris:[$redirect],scopes:$scopes,website:$website}')
     oauth_post "${source}/api/v1/apps" "$registration_payload"
     require_api_success "OAuth client registration"
     client_id=$(jq -er '.client_id | select(type == "string" and length > 0)' <<<"$API_RESPONSE" 2>/dev/null) || \
