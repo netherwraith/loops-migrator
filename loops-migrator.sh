@@ -8,7 +8,7 @@
 set -o pipefail
 
 SCRIPT_VERSION="0.2.0"
-DEFAULT_SOURCE="${LOOPS_SOURCE:-https://loops.federalized.eu}"
+DEFAULT_SOURCE="${LOOPS_SOURCE:-https://your.loops.tld}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 RETRY_BASE_DELAY="${RETRY_BASE_DELAY:-1}"
@@ -45,7 +45,7 @@ Usage:
   ./loops-migrator.sh --version
 
 Options:
-  --source URL       Loops instance (default: https://loops.federalized.eu)
+  --source URL       Loops instance (default: https://loops.your.tld)
   --target URL       Target Loops instance for import
   --token TOKEN      OAuth 2.0 bearer token
   --token-file FILE  Read the bearer token from a file
