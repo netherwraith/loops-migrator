@@ -91,6 +91,7 @@ test_auth_flow_registers_exchanges_and_saves_token() {
     output=$( (
         REQUEST_DELAY=0
         AUTH_WRITE=1
+        AUTH_MANUAL=1
         NO_BROWSER=1
         FORCE=0
         oauth_post() {
@@ -121,6 +122,23 @@ test_auth_flow_registers_exchanges_and_saves_token() {
         jq -e '.grant_type == "authorization_code" and .code == "authorization-code" and .scope == "read write"' "$exchange_file" >/dev/null &&
         [[ "$output" == *'/oauth/authorize?'* ]] &&
         [[ "$output" != *'client-secret'* && "$output" != *'access-token'* ]]
+}
+
+test_loopback_oauth_callback_captures_code_and_state() {
+    local port response result
+    command -v python3 >/dev/null 2>&1 || return 1
+    port=$(choose_loopback_port) || return 1
+    start_oauth_listener "$port"
+    response=$(curl -sS "http://127.0.0.1:${port}/callback?code=callback-code&state=callback-state") || {
+        cleanup_oauth_listener
+        return 1
+    }
+    wait_for_oauth_callback || { cleanup_oauth_listener; return 1; }
+    jq -e '.code == "callback-code" and .state == "callback-state" and .error == ""' \
+        "$OAUTH_CALLBACK_FILE" >/dev/null && [[ "$response" == *'Authorization received'* ]]
+    result=$?
+    cleanup_oauth_listener
+    return "$result"
 }
 
 test_auth_refuses_existing_token_without_force() {
@@ -359,6 +377,7 @@ run_test 'full page without cursor is rejected' test_full_page_without_cursor_re
 run_test 'verification detects changed files' test_verify_detects_tampering
 run_test 'missing option value is rejected' test_missing_option_value_rejected
 run_test 'OAuth flow registers, exchanges and securely saves a token' test_auth_flow_registers_exchanges_and_saves_token
+run_test 'OAuth loopback callback captures code and state' test_loopback_oauth_callback_captures_code_and_state
 run_test 'OAuth flow refuses to overwrite a token without force' test_auth_refuses_existing_token_without_force
 run_test 'complete export builds a token-free manifest' test_complete_export_builds_manifest
 run_test 'import dry run has no side effects' test_import_dry_run_has_no_side_effects

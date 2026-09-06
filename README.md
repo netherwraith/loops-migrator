@@ -6,7 +6,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 This script was initially created for my own purpose and is in no way officially connected to [Loops](https://joinloops.org), the Loops developers or the operators of any instance. Use this script at your own risk!
 
-Version 0.3.1 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
+Version 0.3.2 targets the API behavior of Loops `1.0.0-beta.14`. Export and verification are read-only; import uses the authenticated Studio upload endpoint.
 
 ## Features
 
@@ -30,6 +30,7 @@ Version 0.3.1 targets the API behavior of Loops `1.0.0-beta.14`. Export and veri
 - `curl`
 - `jq`
 - `shasum` (macOS) or `sha256sum` (Linux)
+- `python3` for the automatic local OAuth callback (`--manual-code` works without it)
 
 On macOS, only `jq` normally needs to be installed:
 
@@ -41,7 +42,7 @@ brew install jq
 
 Loops uses OAuth 2.0 bearer tokens. Tokens are instance-specific secrets; a token issued by one Loops server does not authenticate against another.
 
-The migrator automates client registration, opens the Loops authorization page, exchanges the displayed code and stores the resulting token with owner-only permissions:
+The migrator automates client registration, opens the Loops authorization page, receives the callback locally, exchanges the returned code and stores the resulting token with owner-only permissions:
 
 ```bash
 ./loops-migrator.sh auth \
@@ -49,7 +50,9 @@ The migrator automates client registration, opens the Loops authorization page, 
   --token-file ~/.config/loops-migrator-token
 ```
 
-Sign in to Loops in the browser, approve access, then paste the displayed authorization code into the terminal. If no supported browser opener is available, the command prints the URL instead; `--no-browser` forces that behavior.
+Sign in to Loops in the browser and approve access. The browser is redirected to a temporary listener bound exclusively to `127.0.0.1`; it returns the authorization code to the migrator and displays a confirmation page. The listener stops immediately afterward or after a five-minute timeout.
+
+If no supported browser opener is available, the command prints the URL instead; `--no-browser` forces that behavior. The URL must then be opened in a browser on the same computer so it can reach the local callback.
 
 The default authorization requests the official `read` scope and is sufficient for exports. To create a separate token for importing into a target instance, repeat the flow against that instance with write access:
 
@@ -63,6 +66,8 @@ The default authorization requests the official `read` scope and is sufficient f
 This requests `read write`. Existing token files are not overwritten unless `--force` is supplied. Use `--client-name NAME` to change the name shown on the Loops authorization page.
 
 If `--token-file` is omitted, `auth` writes to `~/.config/loops-migrator-token`.
+
+For a remote/headless session where the browser cannot reach the command's localhost, use `--manual-code`. This retains the out-of-band flow: after approval, the browser may report that it cannot open the `urn:ietf:wg:oauth:2.0:oob` address. Copy the complete address containing `code` and `state` from the browser's address bar and paste it into the terminal. The browser error is expected in this fallback mode.
 
 Under the hood, the command follows the official flow: it registers a client with `POST /api/v1/apps`, authorizes it through `/oauth/authorize`, and exchanges the returned code at `/oauth/token`.
 

@@ -2,6 +2,17 @@
 
 All notable changes to Loops Migrator are documented in this file.
 
+## [0.3.2] - 2026-09-06
+
+### Fixed
+
+- Replace the default out-of-band OAuth redirect with an automatic loopback callback, preventing Firefox's unsupported-address page after authorization ([#1]).
+- Validate the returned OAuth state and code before exchanging the token.
+- Keep `--manual-code` as an explicit fallback for remote or headless sessions and document its expected browser behavior.
+
+[0.3.2]: https://github.com/netherwraith/loops-migrator/releases/tag/v0.3.2
+[#1]: https://github.com/netherwraith/loops-migrator/issues/1
+
 ## [0.3.1] - 2026-09-06
 
 ### Fixed

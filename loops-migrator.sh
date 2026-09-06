@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-SCRIPT_VERSION="0.3.1"
+SCRIPT_VERSION="0.3.2"
 DEFAULT_SOURCE="${LOOPS_SOURCE:-https://your.loops.tld}"
 REQUEST_DELAY="${REQUEST_DELAY:-0.5}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -30,6 +30,10 @@ SKIP_THUMBNAILS=0
 UPLOAD_UNCERTAIN=0
 AUTH_WRITE=0
 NO_BROWSER=0
+AUTH_MANUAL=0
+OAUTH_LISTENER_PID=""
+OAUTH_TEMP_DIR=""
+OAUTH_CALLBACK_FILE=""
 
 usage() {
     cat <<'EOF'
@@ -38,7 +42,7 @@ Loops Migrator — export, verify and re-publish Loops videos
 Usage:
   ./loops-migrator.sh auth   [--source URL] [--token-file FILE]
                            [--write] [--client-name NAME] [--no-browser]
-                           [--force] [--debug]
+                           [--manual-code] [--force] [--debug]
   ./loops-migrator.sh export [--source URL] [--token TOKEN | --token-file FILE]
                            [--output-dir DIR] [--metadata-only] [--restart]
                            [--force] [--debug]
@@ -57,6 +61,7 @@ Options:
   --write             Request read/write access for imports (auth only)
   --client-name NAME  OAuth client name (default: Loops Migrator)
   --no-browser        Print the authorization URL without opening it (auth only)
+  --manual-code       Use the out-of-band copy/paste flow instead of localhost
   --output-dir DIR   Backup directory (default: ./loops_backup_TIMESTAMP)
   --input-dir DIR    Existing backup directory to import
   --metadata-only    Export JSON metadata without downloading media
@@ -151,6 +156,122 @@ generate_oauth_state() {
     od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]'
 }
 
+choose_loopback_port() {
+    python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+}
+
+cleanup_oauth_listener() {
+    if [[ -n "$OAUTH_LISTENER_PID" ]] && kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1; then
+        kill "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
+        wait "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
+    fi
+    OAUTH_LISTENER_PID=""
+    if [[ -n "$OAUTH_TEMP_DIR" && -d "$OAUTH_TEMP_DIR" && \
+        "$(basename "$OAUTH_TEMP_DIR")" == loops-migrator-oauth.* ]]; then
+        rm -rf -- "$OAUTH_TEMP_DIR"
+    fi
+    OAUTH_TEMP_DIR=""
+    OAUTH_CALLBACK_FILE=""
+}
+
+start_oauth_listener() {
+    local port="$1" temp_root
+    temp_root="${TMPDIR:-/tmp}"
+    OAUTH_TEMP_DIR=$(mktemp -d "${temp_root%/}/loops-migrator-oauth.XXXXXX") || \
+        die "Could not create the OAuth callback directory."
+    chmod 700 "$OAUTH_TEMP_DIR" || { cleanup_oauth_listener; die "Could not secure the OAuth callback directory."; }
+    OAUTH_CALLBACK_FILE="${OAUTH_TEMP_DIR}/callback.json"
+
+    python3 - "$port" "$OAUTH_CALLBACK_FILE" <<'PY' &
+import html
+import json
+import os
+import sys
+import tempfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+port = int(sys.argv[1])
+result_path = sys.argv[2]
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        payload = {
+            "code": query.get("code", [""])[0],
+            "state": query.get("state", [""])[0],
+            "error": query.get("error", [""])[0],
+            "error_description": query.get("error_description", [""])[0],
+        }
+        if parsed.path != "/callback":
+            self.send_response(404)
+            title = "Invalid callback"
+            message = "This is not the expected Loops OAuth callback."
+        else:
+            fd, temporary_path = tempfile.mkstemp(dir=os.path.dirname(result_path))
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    json.dump(payload, output)
+                os.replace(temporary_path, result_path)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+            self.send_response(200)
+            if payload["error"]:
+                title = "Authorization declined"
+                message = payload["error_description"] or payload["error"]
+            else:
+                title = "Authorization received"
+                message = "You can close this window and return to Loops Migrator."
+        body = ("<!doctype html><meta charset=utf-8><title>{0}</title>"
+                "<style>body{{font:18px system-ui;max-width:42rem;margin:10vh auto;padding:2rem}}"
+                "h1{{font-size:1.6rem}}</style><h1>{0}</h1><p>{1}</p>").format(
+                    html.escape(title), html.escape(message))
+        encoded = body.encode("utf-8")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *_args):
+        pass
+
+
+server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+server.timeout = 300
+server.handle_request()
+server.server_close()
+PY
+    OAUTH_LISTENER_PID=$!
+    sleep 1
+    kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || {
+        wait "$OAUTH_LISTENER_PID" >/dev/null 2>&1 || true
+        cleanup_oauth_listener
+        die "Could not start the local OAuth callback on port ${port}. Use --manual-code as a fallback."
+    }
+}
+
+wait_for_oauth_callback() {
+    local waited=0
+    while [[ ! -s "$OAUTH_CALLBACK_FILE" && "$waited" -lt 300 ]]; do
+        if ! kill -0 "$OAUTH_LISTENER_PID" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    [[ -s "$OAUTH_CALLBACK_FILE" ]]
+}
+
 open_authorization_url() {
     local authorization_url="$1"
     if [[ "$NO_BROWSER" -eq 1 ]]; then
@@ -183,12 +304,20 @@ write_token_file() {
 }
 
 do_auth() {
-    local source="$1" token_file="$2" client_name="$3" scopes redirect_uri
+    local source="$1" token_file="$2" client_name="$3" scopes redirect_uri loopback_port=""
     local registration_payload client_id client_secret state authorization_url authorization_input
-    local authorization_code returned_state token_payload access_token
+    local authorization_code returned_state token_payload access_token callback_error callback_description
     scopes="read"
     [[ "$AUTH_WRITE" -eq 1 ]] && scopes="read write"
-    redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+    if [[ "$AUTH_MANUAL" -eq 1 ]]; then
+        redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+    else
+        command -v python3 >/dev/null 2>&1 || \
+            die "python3 is required for the automatic OAuth callback. Install it or use --manual-code."
+        loopback_port=$(choose_loopback_port) || die "Could not select a local OAuth callback port."
+        [[ "$loopback_port" =~ ^[0-9]+$ ]] || die "Invalid local OAuth callback port."
+        redirect_uri="http://127.0.0.1:${loopback_port}/callback"
+    fi
 
     [[ -n "$token_file" ]] || die "auth requires --token-file FILE or LOOPS_TOKEN_FILE."
     [[ ! -e "$token_file" || "$FORCE" -eq 1 ]] || \
@@ -212,21 +341,42 @@ do_auth() {
     state=$(generate_oauth_state)
     [[ -n "$state" ]] || die "Could not generate OAuth state."
     authorization_url="${source}/oauth/authorize?response_type=code&client_id=$(urlencode "$client_id")&redirect_uri=$(urlencode "$redirect_uri")&scope=$(urlencode "$scopes")&state=$(urlencode "$state")"
+    if [[ "$AUTH_MANUAL" -ne 1 ]]; then
+        start_oauth_listener "$loopback_port"
+        trap 'cleanup_oauth_listener' EXIT INT TERM
+    fi
     echo "  Opening the authorization page in your browser."
     if ! open_authorization_url "$authorization_url"; then
         echo "  Open this URL manually:"
         echo "  ${authorization_url}"
     fi
     echo ""
-    echo "Sign in, approve access, then paste the displayed authorization code."
-    IFS= read -r -p "Authorization code: " authorization_input
-    [[ -n "$authorization_input" ]] || die "No authorization code supplied."
-
-    authorization_code="$authorization_input"
-    if [[ "$authorization_input" == *'code='* ]]; then
-        authorization_code=$(printf '%s' "$authorization_input" | sed -E 's/^.*[?&]code=([^&]*).*$/\1/')
-        returned_state=$(printf '%s' "$authorization_input" | sed -nE 's/^.*[?&]state=([^&]*).*$/\1/p')
-        [[ -n "$returned_state" ]] || die "Redirect URL has no OAuth state."
+    if [[ "$AUTH_MANUAL" -eq 1 ]]; then
+        echo "Sign in, approve access, then paste the displayed authorization code or redirected URL."
+        IFS= read -r -p "Authorization code: " authorization_input
+        [[ -n "$authorization_input" ]] || die "No authorization code supplied."
+        authorization_code="$authorization_input"
+        if [[ "$authorization_input" == *'code='* ]]; then
+            authorization_code=$(printf '%s' "$authorization_input" | sed -E 's/^.*[?&]code=([^&]*).*$/\1/')
+            returned_state=$(printf '%s' "$authorization_input" | sed -nE 's/^.*[?&]state=([^&]*).*$/\1/p')
+            [[ -n "$returned_state" ]] || die "Redirect URL has no OAuth state."
+            [[ "$returned_state" == "$state" ]] || die "OAuth state mismatch; refusing the authorization response."
+        fi
+    else
+        echo "Waiting for the browser authorization callback ..."
+        if ! wait_for_oauth_callback; then
+            cleanup_oauth_listener
+            trap - EXIT INT TERM
+            die "No OAuth callback received within five minutes. Re-run or use --manual-code."
+        fi
+        authorization_code=$(jq -r '.code // empty' "$OAUTH_CALLBACK_FILE")
+        returned_state=$(jq -r '.state // empty' "$OAUTH_CALLBACK_FILE")
+        callback_error=$(jq -r '.error // empty' "$OAUTH_CALLBACK_FILE")
+        callback_description=$(jq -r '.error_description // empty' "$OAUTH_CALLBACK_FILE")
+        cleanup_oauth_listener
+        trap - EXIT INT TERM
+        [[ -z "$callback_error" ]] || die "OAuth authorization failed: ${callback_description:-$callback_error}"
+        [[ -n "$authorization_code" ]] || die "OAuth callback has no authorization code."
         [[ "$returned_state" == "$state" ]] || die "OAuth state mismatch; refusing the authorization response."
     fi
 
@@ -938,6 +1088,7 @@ main() {
             --client-name) require_option_value "$@"; client_name="$2"; shift 2 ;;
             --write) AUTH_WRITE=1; shift ;;
             --no-browser) NO_BROWSER=1; shift ;;
+            --manual-code) AUTH_MANUAL=1; shift ;;
             --output-dir) require_option_value "$@"; output_dir="$2"; shift 2 ;;
             --input-dir) require_option_value "$@"; input_dir="$2"; shift 2 ;;
             --metadata-only) METADATA_ONLY=1; shift ;;
@@ -968,6 +1119,7 @@ main() {
     fi
     [[ "$AUTH_WRITE" -eq 0 ]] || die "--write is only valid with auth."
     [[ "$NO_BROWSER" -eq 0 ]] || die "--no-browser is only valid with auth."
+    [[ "$AUTH_MANUAL" -eq 0 ]] || die "--manual-code is only valid with auth."
     [[ "$client_name" == "Loops Migrator" ]] || die "--client-name is only valid with auth."
     if [[ -n "$token" && -n "$token_file" ]]; then
         die "Use either --token/LOOPS_TOKEN or --token-file/LOOPS_TOKEN_FILE, not both."
